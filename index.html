@@ -267,8 +267,8 @@
 
     <div class="upload-zone" id="dropZone">
       <div class="icon">&#128200;</div>
-      <div><strong>Drop your Fidelity Excel file here</strong></div>
-      <p>or click to browse &mdash; supports .xlsx, .xls, .csv</p>
+      <div><strong>Drop your portfolio export here</strong></div>
+      <p>Fidelity, Schwab, Robinhood, Vanguard, E*Trade, TD Ameritrade, Webull, Merrill, IBKR, SoFi, Public &mdash; .xlsx, .xls, .csv</p>
       <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
     </div>
 
@@ -345,8 +345,33 @@ function processFile(file) {
     const data = new Uint8Array(e.target.result);
     const workbook = XLSX.read(data, { type: 'array' });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const json = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-    if (json.length === 0) { alert('No data found in file.'); return; }
+    let json = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+    // Some brokers (Schwab, Fidelity) put junk rows at the top before the real headers.
+    // Try to find the real header row by looking for a row with "symbol" or "ticker" in it.
+    if (json.length > 0) {
+      const firstHeaders = Object.keys(json[0]).map(h => h.toLowerCase());
+      const hasSymbol = firstHeaders.some(h => h.includes('symbol') || h.includes('ticker') || h.includes('instrument'));
+      if (!hasSymbol && json.length > 1) {
+        // Scan first 15 rows to find real header
+        const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+        for (let i = 0; i < Math.min(rawRows.length, 15); i++) {
+          const row = rawRows[i].map(c => String(c).toLowerCase());
+          if (row.some(c => c.includes('symbol') || c.includes('ticker') || c.includes('instrument'))) {
+            const headerRow = rawRows[i];
+            const dataRows = rawRows.slice(i + 1);
+            json = dataRows.map(r => {
+              const obj = {};
+              headerRow.forEach((h, idx) => { obj[String(h).trim()] = r[idx] != null ? r[idx] : ''; });
+              return obj;
+            }).filter(r => Object.values(r).some(v => v !== ''));
+            break;
+          }
+        }
+      }
+    }
+
+    if (json.length === 0) { alert('No data found in file. Make sure it contains your holdings.'); return; }
     analyzePortfolio(json);
   };
   reader.readAsArrayBuffer(file);
@@ -360,10 +385,18 @@ function resetApp() {
 
 // ── Column Mapping ──
 function findCol(headers, candidates) {
-  const h = headers.map(x => String(x).toLowerCase().trim());
+  const h = headers.map(x => String(x).toLowerCase().replace(/[^a-z0-9]/g, ''));
   for (const c of candidates) {
-    const idx = h.findIndex(x => x.includes(c.toLowerCase()));
-    if (idx !== -1) return headers[idx];
+    const clean = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Exact match first
+    const exact = h.findIndex(x => x === clean);
+    if (exact !== -1) return headers[exact];
+  }
+  for (const c of candidates) {
+    const clean = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Partial match
+    const partial = h.findIndex(x => x.includes(clean) || clean.includes(x));
+    if (partial !== -1) return headers[partial];
   }
   return null;
 }
@@ -563,24 +596,85 @@ function parseNum(val) {
 function analyzePortfolio(data) {
   const headers = Object.keys(data[0]);
 
-  // Map Fidelity columns
-  const symbolCol = findCol(headers, ['symbol', 'ticker', 'Symbol']);
-  const descCol = findCol(headers, ['description', 'name', 'security', 'Description', 'Security']);
-  const qtyCol = findCol(headers, ['quantity', 'shares', 'Quantity', 'Shares']);
-  const priceCol = findCol(headers, ['last price', 'price', 'current price', 'Last Price', 'Current Value']);
-  const valueCol = findCol(headers, ['current value', 'market value', 'value', 'Current Value', 'Market Value']);
-  const costCol = findCol(headers, ['cost basis', 'cost', 'Cost Basis Total', 'Cost Basis']);
-  const gainCol = findCol(headers, ['gain/loss', 'total gain', 'gain', 'Gain/Loss Dollar', 'Unrealized Gain']);
-  const gainPctCol = findCol(headers, ['gain/loss %', '% gain', 'gain %', 'Gain/Loss Percent', 'Percent Gain']);
-  const accountCol = findCol(headers, ['account', 'Account Name', 'Account Number']);
+  // Map columns across all major brokers:
+  // Fidelity: Symbol, Description, Quantity, Last Price, Current Value, Cost Basis Total, Gain/Loss Dollar, Gain/Loss Percent
+  // Schwab: Symbol, Name, Quantity, Price, Market Value, Cost Basis, Gain/Loss, Gain/Loss %
+  // Robinhood: Instrument, Name, Quantity, Average Cost, Equity, Market Value
+  // Vanguard: Symbol, Investment Name, Shares, Share Price, Total Value, Total Cost
+  // E*Trade: Symbol, Description, Quantity, Last Price, Value, Cost Basis, Gain/Loss $, Gain/Loss %
+  // TD Ameritrade: Symbol, Security Description, Quantity, Last Price, Market Value, Average Cost, Gain/Loss $
+  // Merrill Edge: Symbol, Description, Quantity, Price, Value, Cost, Unrealized Gain/Loss
+  // Webull: Symbol, Name/Ticker, Qty, Last, Mkt Value, Cost, P&L, P&L %
+  // Interactive Brokers: Symbol, Description, Position, Close Price, Value, Cost Basis, Unrealized P&L
+  // Wealthfront/Betterment: Ticker, Security, Shares, Price, Value, Cost Basis
+  // SoFi: Name, Ticker, Shares, Price, Market Value, Total Return
+  // Public: Symbol, Name, Shares, Avg Cost, Market Value, Total Return
 
-  // Filter out empty/summary rows
+  const symbolCol = findCol(headers, [
+    'symbol', 'ticker', 'instrument', 'stock', 'fund', 'holding',
+    'security symbol', 'stock symbol', 'ticker symbol',
+  ]);
+  const descCol = findCol(headers, [
+    'description', 'name', 'security', 'security description',
+    'investment name', 'security name', 'holding name', 'company',
+    'stock name', 'fund name',
+  ]);
+  const qtyCol = findCol(headers, [
+    'quantity', 'shares', 'qty', 'position', 'units',
+    'share quantity', 'number of shares', 'total shares',
+  ]);
+  const priceCol = findCol(headers, [
+    'last price', 'price', 'current price', 'close price',
+    'share price', 'last', 'closing price', 'market price',
+    'price per share', 'nav',
+  ]);
+  const valueCol = findCol(headers, [
+    'current value', 'market value', 'value', 'total value',
+    'equity', 'mkt value', 'position value', 'account value',
+    'market val', 'balance',
+  ]);
+  const costCol = findCol(headers, [
+    'cost basis total', 'cost basis', 'cost', 'total cost',
+    'average cost', 'avg cost', 'purchase price', 'book value',
+    'acquisition cost', 'original cost',
+  ]);
+  const gainCol = findCol(headers, [
+    'gain/loss dollar', 'gain/loss', 'unrealized gain/loss',
+    'unrealized p&l', 'unrealized gain', 'total gain/loss',
+    'gain loss', 'p&l', 'profit/loss', 'total return',
+    'gain/loss $', 'profit', 'return',
+  ]);
+  const gainPctCol = findCol(headers, [
+    'gain/loss percent', 'gain/loss %', '% gain', 'gain %',
+    'unrealized gain %', 'p&l %', 'return %', 'percent change',
+    'total return %', '% return', 'percent gain',
+  ]);
+  const accountCol = findCol(headers, [
+    'account', 'account name', 'account number', 'account type',
+    'portfolio', 'portfolio name',
+  ]);
+
+  // Filter out empty rows, summary rows, header duplicates, and footer junk
+  const junkPatterns = [
+    'total', 'account total', 'grand total', 'portfolio total',
+    'cash & cash investments', 'overall', 'summary',
+    'the data', 'as of', 'generated', 'brokerage', '--',
+  ];
   const rows = data.filter(r => {
     const sym = symbolCol ? String(r[symbolCol]).trim() : '';
-    return sym && sym !== '' && sym !== 'Total' && !sym.startsWith('Account Total');
+    if (!sym || sym === '') return false;
+    const symLow = sym.toLowerCase();
+    if (junkPatterns.some(p => symLow === p || symLow.startsWith(p))) return false;
+    // Filter rows where symbol looks like a sentence or date (not a real ticker)
+    if (sym.length > 20) return false;
+    if (sym.includes('/') && sym.length > 8) return false;
+    return true;
   });
 
-  if (rows.length === 0) { alert('Could not parse holdings. Check your file format.'); return; }
+  if (rows.length === 0) {
+    alert('Could not find holdings in your file. Make sure it has columns like Symbol, Quantity, Price or Value.\n\nSupported: Fidelity, Schwab, Robinhood, Vanguard, E*Trade, TD Ameritrade, Webull, Merrill, Interactive Brokers, SoFi, Public, and most CSV exports.');
+    return;
+  }
 
   const riskProfile = document.getElementById('risk').value;
   const age = parseInt(document.getElementById('age').value) || 20;
